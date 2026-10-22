@@ -132,7 +132,7 @@ function createDeps(overrides: {
       }),
       findMany: vi.fn(async ({ where }: { where?: { status?: string; OR?: unknown[] } } = {}) => {
         const now = Date.now();
-        return rows.filter((row) => {
+        const found = rows.filter((row) => {
           if (where?.status && row.status !== where.status) return false;
           if (!where?.OR) return row.status === "pending";
           const next = row.nextAttemptAt;
@@ -140,6 +140,10 @@ function createDeps(overrides: {
           const nextMs = next instanceof Date ? next.getTime() : new Date(String(next)).getTime();
           return nextMs <= now;
         });
+        // The drain reads in send order (orderBy createdAt).
+        return found.every((row) => row.createdAt instanceof Date)
+          ? found.sort((a, b) => (a.createdAt as Date).getTime() - (b.createdAt as Date).getTime())
+          : found;
       }),
       // Earlier undelivered part of the same reply (see hasUndeliveredEarlierPart).
       findFirst: vi.fn(
@@ -1225,12 +1229,10 @@ describe("deliverMessagingOutbound attachments", () => {
         attachment: { name: "report.pdf", mimeType: "application/pdf", data: bytes("key-2") },
       },
     ]);
-    expect(
-      deps.rows.map((row) => [row.idempotencyKey, row.artifactId ?? null, row.status]),
-    ).toEqual([
-      ["msg:m-1", null, "sent"],
-      ["msg:m-1:file:art-1", "art-1", "sent"],
-      ["msg:m-1:file:art-2", "art-2", "sent"],
+    expect(deps.rows.map((row) => [row.idempotencyKey, row.status])).toEqual([
+      ["msg:m-1", "sent"],
+      ["msg:m-1:file:art-1", "sent"],
+      ["msg:m-1:file:art-2", "sent"],
     ]);
     // Bytes come from the artifact store, read in the artifact's own Space.
     expect(deps.artifacts.get).toHaveBeenCalledWith(
@@ -1291,7 +1293,6 @@ describe("deliverMessagingOutbound attachments", () => {
       kind: "dm",
       identityId: "mi-1",
       body: "",
-      artifactId: "art-1",
       sourceMessageId: "m-1",
       status: "pending",
       attempts: MESSAGING_OUTBOUND_MAX_ATTEMPTS - 1,
@@ -1309,7 +1310,6 @@ describe("deliverMessagingOutbound attachments", () => {
           id: "out-1",
           idempotencyKey: "msg:m-1",
           body: "Here you go",
-          artifactId: null,
           status: "sent",
           providerHandle: "text-1",
           createdAt: new Date(1_000),
@@ -1335,6 +1335,53 @@ describe("deliverMessagingOutbound attachments", () => {
     await deliverMessagingOutbound(deps, {}, context);
     expect(sentBodies(deps)).toEqual(["file:chart.png", 'Could not send "chart.png".']);
     expect(deps.rows.map((row) => row.status)).toEqual(["sent", "failed", "sent"]);
+  });
+
+  it("sends the notice in the file's place, before a later reply already queued", async () => {
+    const deps = createDeps({
+      run: null,
+      identity: telegram,
+      artifacts,
+      outboundRows: [
+        {
+          id: "out-1",
+          idempotencyKey: "msg:m-1:file:art-1",
+          kind: "dm",
+          identityId: "mi-1",
+          body: "",
+          sourceMessageId: "m-1",
+          status: "pending",
+          attempts: MESSAGING_OUTBOUND_MAX_ATTEMPTS - 1,
+          nextAttemptAt: null,
+          providerHandle: null,
+          createdAt: new Date(1_000),
+        },
+        {
+          id: "out-2",
+          idempotencyKey: "msg:m-2",
+          kind: "dm",
+          identityId: "mi-1",
+          body: "Later reply",
+          sourceMessageId: "m-2",
+          status: "pending",
+          attempts: 0,
+          nextAttemptAt: null,
+          providerHandle: null,
+          createdAt: new Date(2_000),
+        },
+      ],
+    });
+    deps.sendToThread.mockRejectedValueOnce(new Error("Telegram 500"));
+    await deliverMessagingOutbound(deps, {}, context);
+    // The failure and its notice are saved together.
+    expect(deps.prisma.$transaction).toHaveBeenCalledTimes(1);
+
+    await deliverMessagingOutbound(deps, {}, context);
+    expect(sentBodies(deps)).toEqual([
+      "file:chart.png",
+      'Could not send "chart.png".',
+      "Later reply",
+    ]);
   });
 
   it("drops a file whose artifact is gone or belongs to another Space", async () => {

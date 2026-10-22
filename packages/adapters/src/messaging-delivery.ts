@@ -136,7 +136,6 @@ async function mirrorRun(deps: MessagingDeliveryDeps, runId: string): Promise<vo
           kind: "dm",
           identityId: identity.id,
           body: "",
-          artifactId,
           sourceMessageId: message.id,
         })),
       ];
@@ -475,10 +474,11 @@ async function drain(deps: MessagingDeliveryDeps, context: AdapterContext): Prom
         continue;
       }
       let attachment: MessagingOutboundAttachment | undefined;
-      if (row.artifactId) {
+      const artifactId = fileArtifactId(row.idempotencyKey);
+      if (artifactId) {
         // Scoped to the identity's Space: the drain runs across every Space.
         const artifact = await deps.prisma.artifact.findFirst({
-          where: { id: row.artifactId, spaceId: identity.spaceId },
+          where: { id: artifactId, spaceId: identity.spaceId },
           select: { name: true, mimeType: true, storageKey: true, userId: true },
         });
         if (!artifact) {
@@ -519,14 +519,41 @@ async function drain(deps: MessagingDeliveryDeps, context: AdapterContext): Prom
       const exhausted = failure?.permanent || attempts >= MESSAGING_OUTBOUND_MAX_ATTEMPTS;
       const delayMs = Math.max(messagingOutboundRetryDelayMs(attempts), failure?.retryAfterMs ?? 0);
       const retryAt = exhausted ? null : new Date(Date.now() + delayMs);
-      await deps.prisma.messagingOutbound.updateMany({
+      const outcome = {
         where: { id: row.id },
         data: {
           attempts,
           status: exhausted ? "failed" : "pending",
           nextAttemptAt: retryAt,
         },
-      });
+      };
+      if (exhausted && attachmentName) {
+        // The reply's text went out on its own rows; say the file did not
+        // follow instead of dropping it silently. Saved with the failure so
+        // one cannot land without the other, keyed so it is queued once, and
+        // given the file's place so later replies wait behind it.
+        const name = attachmentName;
+        await deps.prisma.$transaction(async (tx) => {
+          await tx.messagingOutbound.updateMany(outcome);
+          await tx.messagingOutbound.createMany({
+            data: [
+              {
+                idempotencyKey: `${row.idempotencyKey}:notice`,
+                kind: row.kind,
+                identityId: row.identityId,
+                threadId: row.threadId,
+                body: `Could not send "${name}".`,
+                sourceMessageId: row.sourceMessageId,
+                createdAt: row.createdAt,
+              },
+            ],
+            skipDuplicates: true,
+          });
+        });
+        await deps.jobs.enqueue(messagingDeliverJob());
+        continue;
+      }
+      await deps.prisma.messagingOutbound.updateMany(outcome);
       if (!exhausted && retryAt) {
         // Propagate an enqueue failure: the messaging.deliver job then fails
         // and the queue's own retry re-runs the drain. Swallowing it would
@@ -534,23 +561,6 @@ async function drain(deps: MessagingDeliveryDeps, context: AdapterContext): Prom
         // Re-entry is safe: the row is pending again and nextAttemptAt keeps
         // other drains from racing the backoff window.
         await deps.jobs.enqueue(messagingDeliverJob(undefined, retryAt));
-      } else if (exhausted && attachmentName) {
-        // The reply's text went out on its own rows; say the file did not
-        // follow instead of dropping it silently. Keyed so it is queued once.
-        await deps.prisma.messagingOutbound.createMany({
-          data: [
-            {
-              idempotencyKey: `${row.idempotencyKey}:notice`,
-              kind: row.kind,
-              identityId: row.identityId,
-              threadId: row.threadId,
-              body: `Could not send "${attachmentName}".`,
-              sourceMessageId: row.sourceMessageId,
-            },
-          ],
-          skipDuplicates: true,
-        });
-        await deps.jobs.enqueue(messagingDeliverJob());
       }
     }
   }
@@ -626,6 +636,11 @@ export async function applyMessagingOutboundStatus(
     where: { providerHandle: event.handle },
     data: { status },
   });
+}
+
+/** The artifact a reply's file row sends, from its `msg:<message>:file:<artifact>` key. */
+function fileArtifactId(idempotencyKey: string): string | null {
+  return /^msg:[^:]+:file:([^:]+)$/.exec(idempotencyKey)?.[1] ?? null;
 }
 
 /** Artifacts of the message's image and file blocks, in block order. */
