@@ -1,6 +1,8 @@
 import type {
   AdapterContext,
+  ArtifactStore,
   JobPublisher,
+  MessagingOutboundAttachment,
   MessagingOutboundStatus,
   MessagingSurface,
 } from "@rakazo/adapter-kit";
@@ -32,6 +34,7 @@ export interface MessagingDeliveryDeps {
   messaging: MessagingSurface;
   events: Pick<ThreadEvents, "sendUserMessage" | "notify">;
   jobs: Pick<JobPublisher, "enqueue">;
+  artifacts: Pick<ArtifactStore, "get">;
 }
 
 type IdentityRow = {
@@ -44,7 +47,8 @@ type IdentityRow = {
 
 /**
  * Automatic mirror, not a send tool: every text-bearing bot message of a
- * messaging run is copied into the uniform outbox and sent, so delivery does
+ * messaging run is copied into the uniform outbox and sent (with its images
+ * and files on DM platforms that can send them), so delivery does
  * not depend on prompt compliance. DM runs go to the owner's conversation;
  * channel runs go to the group with an attribution prefix and are fanned
  * out internally to peer approved bots (agent-to-agent traffic never
@@ -108,20 +112,34 @@ async function mirrorRun(deps: MessagingDeliveryDeps, runId: string): Promise<vo
     where: { runId: run.id, role: "bot" },
     orderBy: { seq: "asc" },
   });
-  // One row per platform-sized part, so a retry re-sends only the parts that
-  // failed. Explicit createdAt keeps the parts in order for the drain.
+  const sendsFiles = deps.messaging
+    .platforms()
+    .some((platform) => platform.provider === identity.provider && platform.capabilities.files);
+  // One row per platform-sized part, then one per image or file, so a retry
+  // re-sends only the parts that failed and never repeats delivered text.
+  // Explicit createdAt keeps the parts in order for the drain.
   const createdAt = Date.now();
   const rows = messages
     .flatMap((message) => {
       const body = extractText(message.blocks);
-      if (!body) return [];
-      return splitOutboundBody(identity.provider, body).map((part, index) => ({
-        idempotencyKey: index === 0 ? `msg:${message.id}` : `msg:${message.id}:${index + 1}`,
-        kind: "dm",
-        identityId: identity.id,
-        body: part,
-        sourceMessageId: message.id,
-      }));
+      const parts = body ? splitOutboundBody(identity.provider, body) : [];
+      return [
+        ...parts.map((part, index) => ({
+          idempotencyKey: index === 0 ? `msg:${message.id}` : `msg:${message.id}:${index + 1}`,
+          kind: "dm",
+          identityId: identity.id,
+          body: part,
+          sourceMessageId: message.id,
+        })),
+        ...(sendsFiles ? extractArtifactIds(message.blocks) : []).map((artifactId) => ({
+          idempotencyKey: `msg:${message.id}:file:${artifactId}`,
+          kind: "dm",
+          identityId: identity.id,
+          body: "",
+          artifactId,
+          sourceMessageId: message.id,
+        })),
+      ];
     })
     .map((row, index) => ({ ...row, createdAt: new Date(createdAt + index) }));
   if (rows.length === 0) return;
@@ -394,6 +412,7 @@ async function drain(deps: MessagingDeliveryDeps, context: AdapterContext): Prom
       data: { status: "sent", nextAttemptAt: null },
     });
     if (claim.count === 0) continue;
+    let attachmentName: string | null = null;
     try {
       if (row.kind === "group" || row.kind === "intro") {
         if (!row.threadId) {
@@ -455,7 +474,33 @@ async function drain(deps: MessagingDeliveryDeps, context: AdapterContext): Prom
         }
         continue;
       }
-      const sent = await deps.messaging.sendToThread({ threadId, body: row.body }, context);
+      let attachment: MessagingOutboundAttachment | undefined;
+      if (row.artifactId) {
+        // Scoped to the identity's Space: the drain runs across every Space.
+        const artifact = await deps.prisma.artifact.findFirst({
+          where: { id: row.artifactId, spaceId: identity.spaceId },
+          select: { name: true, mimeType: true, storageKey: true, userId: true },
+        });
+        if (!artifact) {
+          // Deleted since the reply was mirrored, or not in this Space.
+          await deps.prisma.messagingOutbound.update({
+            where: { id: row.id },
+            data: { status: "failed" },
+          });
+          continue;
+        }
+        attachmentName = artifact.name;
+        const data = await deps.artifacts.get(artifact.storageKey, {
+          ...context,
+          spaceId: identity.spaceId,
+          userId: artifact.userId,
+        });
+        attachment = { name: artifact.name, mimeType: artifact.mimeType, data };
+      }
+      const sent = await deps.messaging.sendToThread(
+        { threadId, body: row.body, ...(attachment ? { attachment } : {}) },
+        context,
+      );
       await deps.prisma.messagingOutbound.updateMany({
         where: { id: row.id },
         data: { providerHandle: sent.handle },
@@ -489,6 +534,23 @@ async function drain(deps: MessagingDeliveryDeps, context: AdapterContext): Prom
         // Re-entry is safe: the row is pending again and nextAttemptAt keeps
         // other drains from racing the backoff window.
         await deps.jobs.enqueue(messagingDeliverJob(undefined, retryAt));
+      } else if (exhausted && attachmentName) {
+        // The reply's text went out on its own rows; say the file did not
+        // follow instead of dropping it silently. Keyed so it is queued once.
+        await deps.prisma.messagingOutbound.createMany({
+          data: [
+            {
+              idempotencyKey: `${row.idempotencyKey}:notice`,
+              kind: row.kind,
+              identityId: row.identityId,
+              threadId: row.threadId,
+              body: `Could not send "${attachmentName}".`,
+              sourceMessageId: row.sourceMessageId,
+            },
+          ],
+          skipDuplicates: true,
+        });
+        await deps.jobs.enqueue(messagingDeliverJob());
       }
     }
   }
@@ -564,6 +626,16 @@ export async function applyMessagingOutboundStatus(
     where: { providerHandle: event.handle },
     data: { status },
   });
+}
+
+/** Artifacts of the message's image and file blocks, in block order. */
+function extractArtifactIds(blocks: unknown): string[] {
+  if (!Array.isArray(blocks)) return [];
+  return blocks.flatMap((block: { kind?: unknown; artifactId?: unknown } | null) =>
+    (block?.kind === "image" || block?.kind === "file") && typeof block.artifactId === "string"
+      ? [block.artifactId]
+      : [],
+  );
 }
 
 function extractText(blocks: unknown): string {

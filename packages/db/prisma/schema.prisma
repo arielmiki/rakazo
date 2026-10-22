@@ -1366,6 +1366,8 @@ model MessagingOutbound {
   /// Group/intro rows post straight to this provider thread id.
   threadId        String?
   body            String
+  /// Set on a row that sends one image or file from the reply instead of text.
+  artifactId      String?
   status          String    @default("pending")
   attempts        Int       @default(0)
   nextAttemptAt   DateTime?
