@@ -85,8 +85,7 @@ import {
   isOwnerStartedRun,
   isTerminal,
   messagingChannelId,
-  messagingChannelPrivacyBlock,
-  messagingDmSurfaceNote,
+  messagingRunContext,
   newSiteOutcome,
   nextCronDateAcross,
   nextFence,
@@ -2756,7 +2755,7 @@ export interface ExecutorDeps {
   phoneCallCooldownMinutes?: number;
   phoneCallRingSeconds?: number;
   /** Messaging surface; absent means zero identity queries and no chat prompts. */
-  messaging?: { hasIdentity(botId: string): Promise<boolean> };
+  messaging?: { hasIdentity(botId: string): Promise<boolean>; botReplyTag?: string };
   listConnectedPluginSlugs?: (userId: string) => Promise<string[]>;
   /** Builtin web_search / web_fetch. Defaults to keyless HTTP when omitted. */
   web?: WebProvider;
@@ -4156,9 +4155,11 @@ export function createRunExecutor(deps: ExecutorDeps) {
           ? await deps.messaging.hasIdentity(bot.id)
           : false;
         const messagingContext = hasMessagingIdentity
-          ? [messagingDmSurfaceNote(), messagingChannelRun ? messagingChannelPrivacyBlock() : null]
-              .filter(Boolean)
-              .join("\n\n")
+          ? messagingRunContext({
+              trigger: run.trigger,
+              channelRun: messagingChannelRun,
+              botReplyTag: deps.messaging?.botReplyTag,
+            })
           : undefined;
         if (heldForTakeover) {
           const held = await deps.prisma.run.findUnique({

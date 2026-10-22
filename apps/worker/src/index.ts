@@ -161,6 +161,7 @@ async function main() {
   // Telegram — that would steal the single getUpdates slot away from the
   // API process, which is the one with the inbound sink actually wired up.
   const messagingPlatforms = messagingPlatformsFromEnv(messagingEnvFromProcess(process.env));
+  const messagingBotReplyTag = process.env.MESSAGING_BOT_REPLY_TAG?.trim() || undefined;
   const messaging = isMessagingSurfaceEnabled(messagingPlatforms, {
     deploymentModelConfigured,
     openSignup: process.env.MESSAGING_OPEN_SIGNUP === "true",
@@ -244,7 +245,7 @@ async function main() {
     onTicketChange: ticketChanges,
     ticketBoardEnabled,
     ...phoneCallSettings(process.env),
-    messaging: messaging ? createMessagingContextLoader(prisma) : undefined,
+    messaging: messaging ? createMessagingContextLoader(prisma, messagingBotReplyTag) : undefined,
     web: createWebProvider(),
     cloudAgent,
   });
@@ -269,6 +270,7 @@ async function main() {
     deploymentModelKey,
     deploymentModelConfigured,
     messaging,
+    messagingBotReplyTag,
     cloudAgent,
     notifications,
   });

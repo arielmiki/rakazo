@@ -32,6 +32,12 @@ export interface MessagingDeliveryDeps {
   messaging: MessagingSurface;
   events: Pick<ThreadEvents, "sendUserMessage" | "notify">;
   jobs: Pick<JobPublisher, "enqueue">;
+  /**
+   * MESSAGING_BOT_REPLY_TAG: when set, a reply in a run another bot started
+   * reaches the linked chat only if it starts with this tag (stripped before
+   * sending). Unset, every reply is mirrored.
+   */
+  botReplyTag?: string;
 }
 
 type IdentityRow = {
@@ -103,6 +109,7 @@ async function mirrorRun(deps: MessagingDeliveryDeps, runId: string): Promise<vo
 
   // bot_message runs can carry the bot's user-facing reply after a delegate wake.
   // extractText only keeps kind:"text", so inter-bot chatter blocks never leak out.
+  // With botReplyTag set, only replies the bot tagged for the owner leave.
 
   const messages = await deps.prisma.message.findMany({
     where: { runId: run.id, role: "bot" },
@@ -111,9 +118,11 @@ async function mirrorRun(deps: MessagingDeliveryDeps, runId: string): Promise<vo
   // One row per platform-sized part, so a retry re-sends only the parts that
   // failed. Explicit createdAt keeps the parts in order for the drain.
   const createdAt = Date.now();
+  const replyTag = run.trigger === "bot_message" ? deps.botReplyTag : undefined;
   const rows = messages
     .flatMap((message) => {
-      const body = extractText(message.blocks);
+      const text = extractText(message.blocks);
+      const body = replyTag ? stripBotReplyTag(text, replyTag) : text;
       if (!body) return [];
       return splitOutboundBody(identity.provider, body).map((part, index) => ({
         idempotencyKey: index === 0 ? `msg:${message.id}` : `msg:${message.id}:${index + 1}`,
@@ -128,6 +137,16 @@ async function mirrorRun(deps: MessagingDeliveryDeps, runId: string): Promise<vo
   // Atomic dedupe: a concurrent messaging.deliver for the same run loses on
   // the idempotencyKey unique key instead of throwing P2002.
   await deps.prisma.messagingOutbound.createMany({ data: rows, skipDuplicates: true });
+}
+
+/**
+ * The body after a leading reply tag (case-insensitive, leading whitespace
+ * allowed), or undefined when the text does not start with the tag.
+ */
+export function stripBotReplyTag(text: string, tag: string): string | undefined {
+  const trimmed = text.trimStart();
+  if (trimmed.slice(0, tag.length).toLowerCase() !== tag.toLowerCase()) return undefined;
+  return trimmed.slice(tag.length).trimStart() || undefined;
 }
 
 /**

@@ -8,6 +8,7 @@ import {
   MESSAGING_DM_OUTBOUND_CAP,
   MESSAGING_OUTBOUND_MAX_ATTEMPTS,
   type MessagingDeliveryDeps,
+  stripBotReplyTag,
 } from "./messaging-delivery.js";
 
 const context: AdapterContext = {
@@ -69,6 +70,7 @@ function createDeps(overrides: {
   existingOutbox?: unknown;
   sendError?: Error;
   connectionStatus?: string | null;
+  botReplyTag?: string;
 }) {
   const rows = [...(overrides.outboundRows ?? [])] as Array<Record<string, unknown>>;
   const { messaging, sendToThread, openDirectThread } = createFakeSurface(overrides.sendError);
@@ -202,6 +204,7 @@ function createDeps(overrides: {
       notify: vi.fn(async () => undefined),
     } as unknown as MessagingDeliveryDeps["events"],
     jobs: { enqueue: vi.fn(async () => undefined) },
+    botReplyTag: overrides.botReplyTag,
     sendToThread,
     openDirectThread,
     rows,
@@ -291,6 +294,58 @@ describe("deliverMessagingOutbound", () => {
       { threadId: "sendblue:dm-1", body: "Hello from your bot" },
       context,
     );
+  });
+
+  it("mirrors every bot_message reply unchanged when no reply tag is set", async () => {
+    const deps = createDeps({
+      run: { ...messagingRun, trigger: "bot_message" },
+      messages: [
+        { id: "m-1", blocks: [{ kind: "text", text: "Untagged reply" }] },
+        { id: "m-2", blocks: [{ kind: "text", text: "[NOTIFY] tagged reply" }] },
+      ],
+    });
+    await deliverMessagingOutbound(deps, { runId: "run-1" }, context);
+
+    expect(deps.rows.map((row) => row.body)).toEqual(["Untagged reply", "[NOTIFY] tagged reply"]);
+  });
+
+  it("mirrors only tagged bot_message replies, without the tag, when a reply tag is set", async () => {
+    const deps = createDeps({
+      run: { ...messagingRun, trigger: "bot_message" },
+      botReplyTag: "[NOTIFY]",
+      messages: [
+        { id: "m-1", blocks: [{ kind: "text", text: "Status for the other bot only" }] },
+        { id: "m-2", blocks: [{ kind: "text", text: "[NOTIFY] The invoice is paid." }] },
+        { id: "m-3", blocks: [{ kind: "text", text: "Mentions [NOTIFY] mid-sentence" }] },
+        { id: "m-4", blocks: [{ kind: "text", text: "[NOTIFY]" }] },
+      ],
+    });
+    await deliverMessagingOutbound(deps, { runId: "run-1" }, context);
+
+    expect(deps.rows.map((row) => [row.idempotencyKey, row.body])).toEqual([
+      ["msg:m-2", "The invoice is paid."],
+    ]);
+    expect(deps.sendToThread).toHaveBeenCalledTimes(1);
+    expect(deps.sendToThread).toHaveBeenCalledWith(
+      { threadId: "sendblue:dm-1", body: "The invoice is paid." },
+      context,
+    );
+  });
+
+  it("mirrors every reply of an inbound messaging run even when a reply tag is set", async () => {
+    const deps = createDeps({
+      botReplyTag: "[NOTIFY]",
+      messages: [
+        { id: "m-1", blocks: [{ kind: "text", text: "Untagged answer" }] },
+        { id: "m-2", blocks: [{ kind: "text", text: "[NOTIFY] kept as written" }] },
+      ],
+    });
+    await deliverMessagingOutbound(deps, { runId: "run-1" }, context);
+
+    expect(deps.rows.map((row) => row.body)).toEqual([
+      "Untagged answer",
+      "[NOTIFY] kept as written",
+    ]);
   });
 
   it("holds sendblue DM sends at the consecutive-outbound cap", async () => {
@@ -1056,6 +1111,22 @@ describe("deliverMessagingOutbound conversation order", () => {
     expect(deps.rows.every((row) => row.sourceMessageId === "m-1")).toBe(true);
   });
 
+  it("splits a tagged bot_message reply after removing the tag", async () => {
+    const deps = createDeps({
+      run: { ...messagingRun, trigger: "bot_message" },
+      botReplyTag: "[NOTIFY]",
+      identity: whatsapp,
+      messages: [{ id: "m-1", blocks: [{ kind: "text", text: `[NOTIFY] ${longReply}` }] }],
+    });
+    await deliverMessagingOutbound(deps, { runId: "run-1" }, context);
+
+    expect(deps.rows.map((row) => [row.idempotencyKey, row.body])).toEqual([
+      ["msg:m-1", part("a")],
+      ["msg:m-1:2", part("b")],
+      ["msg:m-1:3", part("c")],
+    ]);
+  });
+
   it("re-sends only the parts that failed, in order", async () => {
     const deps = createDeps({
       identity: whatsapp,
@@ -1149,5 +1220,20 @@ describe("deliverMessagingOutbound conversation order", () => {
       context,
     );
     expect(deps.rows.map((row) => row.status)).toEqual(["pending", "pending", "sent"]);
+  });
+});
+
+describe("stripBotReplyTag", () => {
+  it("matches a leading tag regardless of case and surrounding whitespace", () => {
+    expect(stripBotReplyTag("[NOTIFY] Done.", "[NOTIFY]")).toBe("Done.");
+    expect(stripBotReplyTag("  \n[notify]Done.", "[NOTIFY]")).toBe("Done.");
+    expect(stripBotReplyTag("[Notify]\nLine one\nLine two", "[NOTIFY]")).toBe("Line one\nLine two");
+  });
+
+  it("rejects untagged, mid-text, and tag-only replies", () => {
+    expect(stripBotReplyTag("Done.", "[NOTIFY]")).toBeUndefined();
+    expect(stripBotReplyTag("Done [NOTIFY]", "[NOTIFY]")).toBeUndefined();
+    expect(stripBotReplyTag("[NOTIFY]   ", "[NOTIFY]")).toBeUndefined();
+    expect(stripBotReplyTag("[NOTE] Done.", "[NOTIFY]")).toBeUndefined();
   });
 });

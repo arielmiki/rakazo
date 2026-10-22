@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { isMessagingChannelRun, messagingChannelPrivacyBlock } from "./messaging-prompts.js";
+import {
+  isMessagingChannelRun,
+  messagingChannelPrivacyBlock,
+  messagingDmSurfaceNote,
+  messagingRunContext,
+} from "./messaging-prompts.js";
 
 describe("messagingChannelPrivacyBlock", () => {
   it("forbids leaking owner data and allows silent finishes", () => {
@@ -28,5 +33,32 @@ describe("isMessagingChannelRun", () => {
     expect(isMessagingChannelRun("messaging", [{ kind: "text", text: "hi" }])).toBe(false);
     expect(isMessagingChannelRun("user", [channelBlock])).toBe(false);
     expect(isMessagingChannelRun("messaging", undefined)).toBe(false);
+  });
+});
+
+describe("messagingRunContext", () => {
+  it("names the bot reply tag only in runs another bot started", () => {
+    const tagged = messagingRunContext({
+      trigger: "bot_message",
+      channelRun: false,
+      botReplyTag: "[NOTIFY]",
+    });
+    expect(tagged.startsWith(messagingDmSurfaceNote())).toBe(true);
+    expect(tagged).toContain("[NOTIFY]");
+
+    for (const trigger of ["messaging", "user", "routine"]) {
+      expect(messagingRunContext({ trigger, channelRun: false, botReplyTag: "[NOTIFY]" })).toBe(
+        messagingDmSurfaceNote(),
+      );
+    }
+    expect(messagingRunContext({ trigger: "bot_message", channelRun: false })).toBe(
+      messagingDmSurfaceNote(),
+    );
+  });
+
+  it("adds the group privacy rules to channel runs", () => {
+    expect(messagingRunContext({ trigger: "messaging", channelRun: true })).toBe(
+      `${messagingDmSurfaceNote()}\n\n${messagingChannelPrivacyBlock()}`,
+    );
   });
 });

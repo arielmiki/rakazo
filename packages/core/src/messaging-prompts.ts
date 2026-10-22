@@ -9,6 +9,28 @@ export function messagingDmSurfaceNote(): string {
   ].join(" ");
 }
 
+/**
+ * Prompt section for a bot linked to a messaging identity. With a bot reply
+ * tag, runs another bot started are told that only tagged replies reach the
+ * owner's chat.
+ */
+export function messagingRunContext(run: {
+  trigger: string;
+  channelRun: boolean;
+  botReplyTag?: string;
+}): string {
+  const tag = run.trigger === "bot_message" ? run.botReplyTag : undefined;
+  return [
+    messagingDmSurfaceNote(),
+    run.channelRun ? messagingChannelPrivacyBlock() : null,
+    tag
+      ? `Another bot started this turn, so a reply reaches the owner's chat only when it starts with ${tag}. Start a reply with ${tag} only when the owner needs to see it.`
+      : null,
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+}
+
 /** Hard privacy rules for bots posting into shared group channels. */
 export function messagingChannelPrivacyBlock(): string {
   return [

@@ -60,11 +60,19 @@ export function createBackgroundJobHandlers(deps: {
   deploymentModelKey?: string;
   deploymentModelConfigured?: boolean;
   messaging?: MessagingSurface;
+  /** See MessagingDeliveryDeps.botReplyTag. */
+  messagingBotReplyTag?: string;
   cloudAgent?: CloudAgentConnection | null;
   notifications?: ExpoPushProvider;
 }): BackgroundJobHandlers {
   const messagingDeps = deps.messaging
-    ? { prisma: deps.prisma, messaging: deps.messaging, events: deps.events, jobs: deps.jobs }
+    ? {
+        prisma: deps.prisma,
+        messaging: deps.messaging,
+        events: deps.events,
+        jobs: deps.jobs,
+        botReplyTag: deps.messagingBotReplyTag,
+      }
     : undefined;
   // The outbox holds every Space's pending sends, so draining it is cross-tenant.
   const drainMessaging = async () => {

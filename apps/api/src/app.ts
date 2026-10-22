@@ -572,7 +572,9 @@ async function buildApp(overrides: CreateAppOverrides): Promise<AppHandles> {
     phoneCallsEnabled: env.phoneCallsEnabled,
     phoneCallRingSeconds: env.phoneCallRingSeconds,
     phoneCallCooldownMinutes: env.phoneCallCooldownMinutes,
-    messaging: messaging ? createMessagingContextLoader(prisma) : undefined,
+    messaging: messaging
+      ? createMessagingContextLoader(prisma, env.messagingBotReplyTag)
+      : undefined,
     web: createWebProvider(),
     cloudAgent,
     shutdownSignal: shutdown.signal,
@@ -593,6 +595,7 @@ async function buildApp(overrides: CreateAppOverrides): Promise<AppHandles> {
     deploymentModelKey: env.deploymentModelKey,
     deploymentModelConfigured: env.deploymentModelConfigured,
     messaging,
+    messagingBotReplyTag: env.messagingBotReplyTag,
     cloudAgent,
   });
   if (inMemoryJobs) {
